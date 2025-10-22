@@ -44,4 +44,4 @@ async def check_subscription(event):
         await event.delete()
 
 print("🤖 Bot is running 24/7...")
-client.run_until_disconnected() telegram-bot
+client.run_until_disconnected()
