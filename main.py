@@ -1,47 +1,75 @@
-from telethon import TelegramClient, events
 import os
+import asyncio
+from telethon import TelegramClient, events, errors
 
-# ----- Environment Variables -----
-api_id = int(os.getenv("API_ID"))
-api_hash = os.getenv("API_HASH")
-bot_token = os.getenv("BOT_TOKEN")
-channels = os.getenv("CHANNELS").split(",")
+# ---------------------------
+# 1. Read environment variables (never hardcode secrets!)
+# ---------------------------
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNELS = os.getenv("CHANNELS", "")  # comma separated, only @usernames
 
-# Initialize client
-client = TelegramClient('bot', api_id, api_hash).start(bot_token=bot_token)
+# Validate
+if not (API_ID and API_HASH and BOT_TOKEN):
+    raise RuntimeError("Missing API_ID, API_HASH or BOT_TOKEN in environment variables.")
 
-# ----- Welcome Message -----
-@client.on(events.ChatAction)
-async def welcome(event):
-    if event.user_joined or event.user_added:
-        msg = (
-            "👋 **Welcome to the group!**\n\n"
-            "Before chatting, please subscribe to our channels:\n\n"
-            f"📢 [Channel 1]({channels[0].strip()})\n"
-            f"🎬 [Channel 2]({channels[1].strip()})\n\n"
-            "After subscribing, you can chat freely! 😄"
-        )
-        await event.reply(msg, link_preview=False)
+# Normalize channels list
+channels = [c.strip() for c in CHANNELS.split(",") if c.strip()]
 
-# ----- Subscription Check -----
-@client.on(events.NewMessage)
-async def check_subscription(event):
-    user = await event.get_sender()
-    subscribed = True
+# ---------------------------
+# 2. Initialize Telegram Client
+# ---------------------------
+client = TelegramClient('bot', API_ID, API_HASH)
+
+# ---------------------------
+# 3. Helper function: check subscriptions
+# ---------------------------
+async def check_user_subscriptions(user_id):
+    not_subscribed = []
     for ch in channels:
         try:
-            await client.get_participant(ch.strip(), user.id)
-        except:
-            subscribed = False
-            break
-    if not subscribed:
-        warn = (
-            "⚠️ Please subscribe to both channels before chatting:\n\n"
-            f"📢 {channels[0].strip()}\n"
-            f"🎬 {channels[1].strip()}"
-        )
-        await event.reply(warn, link_preview=False)
-        await event.delete()
+            await client.get_participant(ch, user_id)
+        except errors.UserNotParticipantError:
+            not_subscribed.append(ch)
+        except errors.RPCError:
+            not_subscribed.append(ch)
+        except Exception:
+            not_subscribed.append(ch)
+    return not_subscribed
 
-print("🤖 Bot is running 24/7...")
-client.run_until_disconnected()
+# ---------------------------
+# 4. Event: New user joins / added
+# ---------------------------
+@client.on(events.ChatAction)
+async def handler(event):
+    if event.user_joined or event.user_added:
+        try:
+            user = await event.get_user()
+            not_subs = await check_user_subscriptions(user.id)
+            if not_subs:
+                text = (
+                    f"Welcome {user.first_name or 'there'}! 👋\n\n"
+                    "Please subscribe to these channels to continue:\n" +
+                    "\n".join(f"- {c}" for c in not_subs) +
+                    "\n\nAfter subscribing, send any message here to continue."
+                )
+                await event.reply(text)
+            else:
+                await event.reply(
+                    f"Welcome {user.first_name or 'there'}! ✅ You are subscribed — enjoy the chat."
+                )
+        except Exception as e:
+            await event.reply("Welcome! Please make sure you are subscribed to required channels to continue.")
+            print("Error in welcome handler:", e)
+
+# ---------------------------
+# 5. Run the bot
+# ---------------------------
+async def main():
+    await client.start(bot_token=BOT_TOKEN)
+    print("Bot started successfully.")
+    await client.run_until_disconnected()
+
+if __name__ == "__main__":
+    asyncio.run(main())
