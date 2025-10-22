@@ -1,26 +1,27 @@
-# main.py
 import os
 import time
 import asyncio
 import sqlite3
 import re
-from telethon import TelegramClient, events, types
-from telethon.errors import FloodWaitError, UserNotParticipantError
+from telethon import TelegramClient, events
+from telethon.errors import UserNotParticipantError, FloodWaitError
 from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.types import ChannelParticipant
 
-# ----------------- Config from env -----------------
-API_ID = int(os.getenv("API_ID") or 0)
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_1 = os.getenv("CHANNEL_1")  # e.g. https://t.me/spredsubscriberAjay755 or @spredsubscriberAjay755
-CHANNEL_2 = os.getenv("CHANNEL_2")  # e.g. https://t.me/Girls_movies_intrester_com_me
-UPI_ID = os.getenv("UPI_ID") or "7051946740@ybl"  # default to your UPI if not set
+# ---------------- CONFIG ----------------
+API_ID = int(os.getenv("API_ID") or "your_api_id_here")
+API_HASH = os.getenv("API_HASH") or "your_api_hash_here"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "your_bot_token_here"
+OWNER_ID = int(os.getenv("OWNER_ID") or 7051946740)
+UPI_ID = os.getenv("UPI_ID") or "7051946740@ybl"
+CHANNELS = os.getenv("CHANNELS", "").split(",") or [
+    "https://t.me/spredsubscriberAjay755",
+    "https://t.me/Girls_movies_intrester_com_me"
+]
 
 DB = "data.db"
 os.makedirs("payments", exist_ok=True)
 
-# ----------------- Database -----------------
+# ---------------- DATABASE ----------------
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -46,19 +47,22 @@ def init_db():
 
 init_db()
 
+# ---------------- USER FUNCTIONS ----------------
+import datetime
+
 def set_trial(user_id):
-    import datetime
     expires = (datetime.datetime.utcnow() + datetime.timedelta(days=1)).isoformat()
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users (user_id, trial_expires_at, paid_until, channels_joined) VALUES (?, ?, ?, COALESCE((SELECT channels_joined FROM users WHERE user_id=?),0))",
-              (user_id, expires, None, user_id))
+    c.execute(
+        "INSERT OR REPLACE INTO users (user_id, trial_expires_at, paid_until, channels_joined) VALUES (?, ?, COALESCE((SELECT paid_until FROM users WHERE user_id=?),NULL), COALESCE((SELECT channels_joined FROM users WHERE user_id=?),0))",
+        (user_id, expires, user_id, user_id)
+    )
     conn.commit()
     conn.close()
     return expires
 
 def mark_paid(user_id, days=30, txnid=None, filename=None):
-    import datetime
     paid_until = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat()
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -72,7 +76,6 @@ def mark_paid(user_id, days=30, txnid=None, filename=None):
     return paid_until
 
 def has_access(user_id):
-    import datetime
     conn = sqlite3.connect(DB)
     c = conn.cursor()
     c.execute("SELECT trial_expires_at, paid_until FROM users WHERE user_id=?", (user_id,))
@@ -97,44 +100,23 @@ def set_channels_joined(user_id):
     conn.commit()
     conn.close()
 
-def user_channels_joined(user_id):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT channels_joined FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return bool(row and row[0])
-
-# ----------------- Telethon client -----------------
-if not API_ID or not API_HASH or not BOT_TOKEN:
-    raise SystemExit("Environment variables API_ID, API_HASH and BOT_TOKEN must be set")
-
+# ---------------- TELETHON CLIENT ----------------
 client = TelegramClient("bot", API_ID, API_HASH)
 
-# regex to detect txn ids (simple heuristic — adjust if needed)
 TXN_RE = re.compile(r'\b[0-9A-Za-z]{6,30}\b')
-
-# Anti-flood: per-user timestamp
 recent_users = {}
 
 async def is_member_of_channel(user_id, channel):
-    """
-    Returns True if user_id is participant of channel.
-    channel can be @username or invite link. We try to resolve entity.
-    """
     try:
-        # resolve channel entity
         ch_entity = await client.get_entity(channel)
-        # call GetParticipantRequest
         await client(GetParticipantRequest(ch_entity, user_id))
         return True
     except UserNotParticipantError:
         return False
-    except Exception as e:
-        # could be channel missing or privacy; treat as False
+    except Exception:
         return False
 
-# Flood-wait safe start
+# ---------------- CONNECT CLIENT ----------------
 def connect_client():
     while True:
         try:
@@ -150,8 +132,7 @@ def connect_client():
 
 connect_client()
 
-# ----------------- Handlers -----------------
-
+# ---------------- HANDLERS ----------------
 @client.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
     user_id = event.sender_id
@@ -159,46 +140,41 @@ async def start_handler(event):
         await event.respond("✅ آپ کے پاس پہلے ہی access ہے — enjoy!")
         return
     expires = set_trial(user_id)
+    channels_text = "\n".join(CHANNELS)
     await event.respond(
         f"🎁 You got a 1-day free trial (until {expires}).\n\n"
-        f"📢 Please JOIN these channels first:\n"
-        f"{CHANNEL_1}\n{CHANNEL_2}\n\n"
+        f"📢 Please JOIN these channels first:\n{channels_text}\n\n"
         f"💰 To extend, pay ₹10 via UPI to {UPI_ID} and send a screenshot or paste txn id here.\n"
         "After payment, your access will be activated for 30 days."
     )
 
 @client.on(events.ChatAction)
 async def welcome_new(event):
-    # When new member joins a group where the bot is present
     if event.user_joined or event.user_added:
         try:
             user = await event.get_user()
+            channels_text = "\n".join(CHANNELS)
             await event.reply(
                 f"👋 Welcome {user.first_name}!\n\n"
-                f"Please JOIN these channels before chatting:\n{CHANNEL_1}\n{CHANNEL_2}\n\n"
-                f"Then pay ₹10 to {UPI_ID} and send a screenshot here to get full access."
+                f"Please JOIN these channels before chatting:\n{channels_text}\n\n"
+                f"Then pay ₹10 via UPI to {UPI_ID} and send a screenshot in private to get full access."
             )
         except Exception as e:
             print("welcome error:", e)
 
 @client.on(events.NewMessage)
 async def payment_and_group_control(event):
-    # avoid reacting to our own or other bots or edited messages
     if event.out or (event.sender and getattr(event.sender, "bot", False)):
         return
 
-    # If user sends a photo (assume payment screenshot)
     user_id = event.sender_id
-
-    # Rate limit: avoid replying too often per user
     now = time.time()
     if user_id in recent_users and now - recent_users[user_id] < 5:
         return
     recent_users[user_id] = now
 
-    # If private chat: handle payments and instructions
+    # Private chat handling
     if event.is_private:
-        # If photo(s) -> save screenshot & auto mark paid
         if event.media:
             try:
                 file_path = await event.download_media(file="payments/")
@@ -210,7 +186,6 @@ async def payment_and_group_control(event):
                 print("save media error:", e)
                 return
 
-        # Check text for txn id
         text = (event.raw_text or "").strip()
         m = TXN_RE.search(text)
         if m and len(m.group(0)) >= 6:
@@ -219,50 +194,47 @@ async def payment_and_group_control(event):
             await event.respond(f"✔️ Transaction id `{txn}` received and accepted. Access active until {paid_until} UTC.")
             return
 
-        # Otherwise: remind to join channels and pay
+        channels_text = "\n".join(CHANNELS)
         await event.respond(
-            f"Please join these channels first:\n{CHANNEL_1}\n{CHANNEL_2}\n\n"
+            f"Please join these channels first:\n{channels_text}\n\n"
             f"Then pay ₹10 to {UPI_ID} and send screenshot here. After verification, you'll get 30 days access."
         )
         return
 
-    # If message is in a group: enforce subscription/access
+    # Group chat handling
     if event.is_group:
-        # skip if this message is from the bot itself
-        if event.message and event.message.sender_id == (await client.get_me()).id:
+        if has_access(user_id):
             return
 
-        # If user has access -> allow
-        if has_access(user_id):
-            return  # do nothing, allow message
+        joined_all = True
+        for ch in CHANNELS:
+            if not await is_member_of_channel(user_id, ch):
+                joined_all = False
+                break
 
-        # If user doesn't have access, check if they joined channels (we try)
-        joined1 = await is_member_of_channel(user_id, CHANNEL_1)
-        joined2 = await is_member_of_channel(user_id, CHANNEL_2)
-        if joined1 and joined2:
-            # mark channels joined and give trial if none
+        if joined_all:
             set_channels_joined(user_id)
-            # if no trial or paid, give trial now
             if not has_access(user_id):
                 set_trial(user_id)
                 await event.reply("🎁 You were given a 1-day trial for joining the channels. Enjoy!")
             return
 
-        # Neither paid nor joined: delete message (if bot has permission) and instruct
         try:
             await event.delete()
         except Exception:
             pass
+
+        channels_text = "\n".join(CHANNELS)
         try:
             await event.reply(
-                f"❌ You need access to chat.\n1) Join these channels: {CHANNEL_1} and {CHANNEL_2}\n"
-                f"2) Pay ₹10 via UPI to {UPI_ID} and send a screenshot in private to me.\n\n"
+                f"❌ You need access to chat.\n1) Join these channels:\n{channels_text}\n"
+                f"2) Pay ₹10 via UPI to {UPI_ID} and send a screenshot in private.\n\n"
                 "After that you'll be allowed to chat."
             )
         except Exception as e:
             print("reply error:", e)
 
-# ----------------- Keep process alive and auto-reconnect loop -----------------
+# ---------------- MAIN LOOP ----------------
 async def main_loop():
     while True:
         try:
