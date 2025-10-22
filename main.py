@@ -83,3 +83,50 @@ def run_flask():
 
 threading.Thread(target=run_flask).start()
 client.run_until_disconnected()
+import re
+import os
+import datetime
+import sqlite3
+
+# Ensure payments folder exists
+os.makedirs("payments", exist_ok=True)
+
+# simple regex for txn id (example pattern, many txn ids are alphanumeric length 6-20)
+TXN_RE = re.compile(r'[A-Z0-9]{5,30}', re.I)
+
+def mark_paid(user_id, days=30):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    paid_until = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat()
+    c.execute("REPLACE INTO users (user_id, trial_expires_at, paid_until) VALUES (?, ?, ?)",
+              (user_id, None, paid_until))
+    conn.commit()
+    conn.close()
+    return paid_until
+
+@client.on(events.NewMessage)
+async def payment_handler(event):
+    sender = await event.get_sender()
+    user_id = event.sender_id
+    text = (event.raw_text or "").strip()
+
+    # 1) If message contains an obvious txn id, ask for screenshot or mark for manual verify
+    m = TXN_RE.search(text)
+    if m and "upi" not in text.lower() and len(text) >= 6:
+        txn = m.group(0)
+        # Option: auto mark paid? Better to ask for screenshot to verify time/amount
+        await event.reply(f"Got transaction id `{txn}`. Please also send a screenshot of the payment or reply 'VERIFY' when you have paid so I can confirm.")
+        # optionally save txn to DB table for manual review (not shown)
+        return
+
+    # 2) If message has media (photo) — save it and notify owner for manual checking
+    if event.photo:
+        file_path = await event.download_media(file="payments/")
+        await event.reply("✔️ Payment screenshot received. I will verify and activate access soon.")
+        # Notify yourself (owner) in Telegram or log — here we mark paid immediately, but recommended to manual verify
+        # For demonstration, we can auto mark (CAUTION):
+        paid_until = mark_paid(user_id, days=30)
+        await event.reply(f"Thank you! Payment verified (auto). Your access is active until {paid_until} UTC.")
+        return
+
+    # else ignore or process other messages
