@@ -1,5 +1,6 @@
-my_bot/
-├── main.py
-├── requirements.txt
-├── README_DEPLOY.txt   # quick deploy steps (optional)
-└── payments/           # folder (empty) — screenshots saved here
+MyTelegramBot/
+│
+├─ config.json
+├─ main.py
+├─ requirements.txt
+└─ payments/    # optional, auto-created by main.py
