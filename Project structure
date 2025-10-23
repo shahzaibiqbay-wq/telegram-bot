@@ -1,6 +1,0 @@
-MyTelegramBot/
-│
-├─ config.json
-├─ main.py
-├─ requirements.txt
-└─ payments/    # optional, auto-created by main.py
