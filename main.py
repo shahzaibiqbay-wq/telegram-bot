@@ -1,254 +1,234 @@
+# main.py
 import os
-import time
 import asyncio
-import sqlite3
-import re
-from telethon import TelegramClient, events
-from telethon.errors import UserNotParticipantError, FloodWaitError
+from telethon import TelegramClient, events, types, errors
 from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.types import PeerChannel, PeerUser
+from flask import Flask
+from threading import Thread
 
-# ---------------- CONFIG ----------------
-API_ID = int(os.getenv("API_ID") or "your_api_id_here")
-API_HASH = os.getenv("API_HASH") or "your_api_hash_here"
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "your_bot_token_here"
-OWNER_ID = int(os.getenv("OWNER_ID") or 7051946740)
-UPI_ID = os.getenv("UPI_ID") or "7051946740@ybl"
-CHANNELS = os.getenv("CHANNELS", "").split(",") or [
-    "https://t.me/spredsubscriberAjay755",
-    "https://t.me/Girls_movies_intrester_com_me"
-]
+# ---------- Config from env ----------
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHANNEL = os.getenv("CHANNEL", "")   # e.g. @MyChannel or numeric id - channel the users must join
+GROUP = os.getenv("GROUP", "")       # e.g. @MyGroup or numeric id - group where bot moderates
+WELCOME_MESSAGE = os.getenv("WELCOME_MESSAGE",
+    "👋 Welcome! To continue chatting please subscribe to our channel: {channel}\nAfter subscribing, send any message and I'll allow you to chat."
+)
 
-DB = "data.db"
-os.makedirs("payments", exist_ok=True)
+# ---------- Basic checks ----------
+if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL, GROUP]):
+    raise Exception("Missing one of required env vars: API_ID, API_HASH, BOT_TOKEN, CHANNEL, GROUP")
 
-# ---------------- DATABASE ----------------
-def init_db():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            trial_expires_at TEXT,
-            paid_until TEXT,
-            channels_joined INTEGER DEFAULT 0
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT,
-            txnid TEXT,
-            created_at TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# ---------- Telethon client ----------
+client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-init_db()
-
-# ---------------- USER FUNCTIONS ----------------
-import datetime
-
-def set_trial(user_id):
-    expires = (datetime.datetime.utcnow() + datetime.timedelta(days=1)).isoformat()
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO users (user_id, trial_expires_at, paid_until, channels_joined) VALUES (?, ?, COALESCE((SELECT paid_until FROM users WHERE user_id=?),NULL), COALESCE((SELECT channels_joined FROM users WHERE user_id=?),0))",
-        (user_id, expires, user_id, user_id)
-    )
-    conn.commit()
-    conn.close()
-    return expires
-
-def mark_paid(user_id, days=30, txnid=None, filename=None):
-    paid_until = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users (user_id, trial_expires_at, paid_until, channels_joined) VALUES (?, NULL, ?, 1)",
-              (user_id, paid_until))
-    if txnid or filename:
-        c.execute("INSERT INTO payments (user_id, filename, txnid, created_at) VALUES (?, ?, ?, ?)",
-                  (user_id, filename, txnid, datetime.datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-    return paid_until
-
-def has_access(user_id):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT trial_expires_at, paid_until FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return False
-    now = datetime.datetime.utcnow()
-    for val in row:
-        if val:
-            try:
-                if datetime.datetime.fromisoformat(val) > now:
-                    return True
-            except Exception:
-                continue
-    return False
-
-def set_channels_joined(user_id):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("UPDATE users SET channels_joined=1 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-# ---------------- TELETHON CLIENT ----------------
-client = TelegramClient("bot", API_ID, API_HASH)
-
-TXN_RE = re.compile(r'\b[0-9A-Za-z]{6,30}\b')
-recent_users = {}
-
-async def is_member_of_channel(user_id, channel):
+# ---------- Helper functions ----------
+async def is_member_of_channel(user_id: int) -> bool:
+    """
+    Returns True if user_id is a participant of CHANNEL.
+    Uses GetParticipantRequest which is fast and explicit.
+    """
     try:
-        ch_entity = await client.get_entity(channel)
-        await client(GetParticipantRequest(ch_entity, user_id))
+        # channel may be username or id; Telethon accepts either
+        await client(GetParticipantRequest(channel=CHANNEL, user_id=user_id))
         return True
-    except UserNotParticipantError:
+    except errors.UserNotParticipantError:
+        return False
+    except errors.ChannelPrivateError:
+        # channel is private / bot can't access; treat as not a member
+        return False
+    except errors.RPCError:
+        # any other RPC problem — be conservative and return False
         return False
     except Exception:
         return False
 
-# ---------------- CONNECT CLIENT ----------------
-def connect_client():
-    while True:
-        try:
-            client.start(bot_token=BOT_TOKEN)
-            print("✅ Bot connected")
-            break
-        except FloodWaitError as e:
-            print(f"FloodWaitError: waiting {e.seconds} seconds...")
-            time.sleep(e.seconds + 5)
-        except Exception as e:
-            print("Connect error:", e)
-            time.sleep(5)
+async def ensure_bot_admin_in_group(chat):
+    """
+    Quick check: ensure bot has Delete Messages rights in the target group.
+    """
+    try:
+        # fetch chat full info
+        full = await client.get_entity(chat)
+        # This is a light check; actual deletion attempt will reveal permission issues.
+        return True
+    except Exception:
+        return False
 
-connect_client()
-
-# ---------------- HANDLERS ----------------
-@client.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
-    user_id = event.sender_id
-    if has_access(user_id):
-        await event.respond("✅ آپ کے پاس پہلے ہی access ہے — enjoy!")
-        return
-    expires = set_trial(user_id)
-    channels_text = "\n".join(CHANNELS)
-    await event.respond(
-        f"🎁 You got a 1-day free trial (until {expires}).\n\n"
-        f"📢 Please JOIN these channels first:\n{channels_text}\n\n"
-        f"💰 To extend, pay ₹10 via UPI to {UPI_ID} and send a screenshot or paste txn id here.\n"
-        "After payment, your access will be activated for 30 days."
-    )
-
+# ---------- Events: Welcome for new members ----------
 @client.on(events.ChatAction)
-async def welcome_new(event):
+async def handler_chat_action(event):
+    # Only handle joins/adds in the configured group
+    try:
+        chat = event.chat_id or event.chat
+        # Convert GROUP env to id/username - compare with event.chat_id when possible
+        # We'll check by comparing event.chat.title or id against GROUP when GROUP is numeric or username.
+    except Exception:
+        return
+
+    # Determine if this chat is the target group
+    try:
+        target = GROUP
+        # If GROUP given as numeric (string of digits), compare ids
+        if GROUP.isdigit():
+            if event.chat_id != int(GROUP):
+                return
+        else:
+            # If GROUP is username like @MyGroup, compare using chat.username if available
+            chat_entity = await event.get_chat()
+            username = getattr(chat_entity, 'username', None)
+            if username:
+                if not (GROUP.lstrip('@').lower() == username.lower()):
+                    return
+            else:
+                # fallback: compare title or id - if not match, proceed (we are conservative)
+                pass
+    except Exception:
+        # if any problem, allow processing (so it still works in many setups)
+        pass
+
+    # New user joined or was added
     if event.user_joined or event.user_added:
+        # event.user may be None; get users list
         try:
-            user = await event.get_user()
-            channels_text = "\n".join(CHANNELS)
-            await event.reply(
-                f"👋 Welcome {user.first_name}!\n\n"
-                f"Please JOIN these channels before chatting:\n{channels_text}\n\n"
-                f"Then pay ₹10 via UPI to {UPI_ID} and send a screenshot in private to get full access."
-            )
-        except Exception as e:
-            print("welcome error:", e)
+            users = await event.get_users()
+        except Exception:
+            users = []
 
-@client.on(events.NewMessage)
-async def payment_and_group_control(event):
-    if event.out or (event.sender and getattr(event.sender, "bot", False)):
-        return
-
-    user_id = event.sender_id
-    now = time.time()
-    if user_id in recent_users and now - recent_users[user_id] < 5:
-        return
-    recent_users[user_id] = now
-
-    # Private chat handling
-    if event.is_private:
-        if event.media:
+        # loop through users if multiple
+        for u in users:
             try:
-                file_path = await event.download_media(file="payments/")
-                paid_until = mark_paid(user_id, days=30, filename=file_path)
-                await event.respond(f"✔️ Payment screenshot received and accepted. Your access is active until {paid_until} UTC.")
-                return
-            except Exception as e:
-                await event.respond("⚠️ Could not save screenshot, please try again.")
-                print("save media error:", e)
-                return
+                # send welcome message in group (tag user)
+                name = u.first_name or "there"
+                msg = WELCOME_MESSAGE.format(channel=CHANNEL)
+                await event.reply(f"👋 {name}\n{msg}")
+            except Exception:
+                # ignore send errors
+                pass
 
-        text = (event.raw_text or "").strip()
-        m = TXN_RE.search(text)
-        if m and len(m.group(0)) >= 6:
-            txn = m.group(0)
-            paid_until = mark_paid(user_id, days=30, txnid=txn)
-            await event.respond(f"✔️ Transaction id `{txn}` received and accepted. Access active until {paid_until} UTC.")
-            return
-
-        channels_text = "\n".join(CHANNELS)
-        await event.respond(
-            f"Please join these channels first:\n{channels_text}\n\n"
-            f"Then pay ₹10 to {UPI_ID} and send screenshot here. After verification, you'll get 30 days access."
-        )
+# ---------- Events: New messages in group ----------
+@client.on(events.NewMessage)
+async def handler_new_message(event):
+    """
+    Main moderation logic:
+    - Only operates inside the configured GROUP
+    - If the sender is not subscribed to CHANNEL -> delete their message and send them a DM with join link
+    - If the sender is subscribed -> allow message
+    """
+    # Ignore if message is from a channel or from the bot itself
+    if event.is_channel or event.out:
         return
 
-    # Group chat handling
-    if event.is_group:
-        if has_access(user_id):
+    # Ensure the message is in the target group
+    try:
+        # If GROUP specified as digits, compare chat id
+        if GROUP.isdigit():
+            if event.chat_id != int(GROUP):
+                return
+        else:
+            # try to resolve the chat username
+            chat_entity = await event.get_chat()
+            username = getattr(chat_entity, 'username', None)
+            if username:
+                if username.lower() != GROUP.lstrip('@').lower():
+                    return
+            else:
+                # if no username, try title compare if provided as plain text - skip strict check
+                # proceed anyway (best-effort)
+                pass
+    except Exception:
+        # if resolution fails, skip - avoid breaking bot
+        pass
+
+    sender = await event.get_sender()
+    if not sender:
+        return
+
+    # Allow if sender is a bot (optional) or sender is admin (so admins don't get deleted)
+    try:
+        if sender.bot:
             return
+    except Exception:
+        pass
 
-        joined_all = True
-        for ch in CHANNELS:
-            if not await is_member_of_channel(user_id, ch):
-                joined_all = False
-                break
+    # Check if sender is member of CHANNEL
+    user_id = sender.id
+    allowed = await is_member_of_channel(user_id)
 
-        if joined_all:
-            set_channels_joined(user_id)
-            if not has_access(user_id):
-                set_trial(user_id)
-                await event.reply("🎁 You were given a 1-day trial for joining the channels. Enjoy!")
-            return
-
+    if allowed:
+        # user is subscribed -> do nothing; maybe send a tiny thumbs up for first allowed message? (commented)
+        # You could implement a "first message allowed" notice if desired.
+        return
+    else:
+        # Delete the message in group (bot must have permission to delete)
         try:
             await event.delete()
+        except errors.ChatAdminRequiredError:
+            # Bot lacks delete permission
+            # Optionally notify the group owner or log
+            try:
+                await event.reply("⚠️ I need 'Delete messages' admin permission to auto-delete non-subscribed members' messages. Please promote me as admin.")
+            except Exception:
+                pass
+            return
+        except Exception:
+            # any other delete error - ignore
+            pass
+
+        # Send a private message to user with instructions and channel link
+        try:
+            dm_text = (
+                "🔒 Your message was removed from the group because you haven't subscribed to our channel yet.\n\n"
+                f"✅ Please join {CHANNEL} first. After joining, send any message in the group again and it will be allowed.\n\n"
+                "If you can't join via username, open this link: https://t.me/{channel_username}\n\n"
+                "If you already joined, try waiting a few seconds and resend your message."
+            )
+            # Compose channel_username if CHANNEL is @username
+            channel_username = CHANNEL.lstrip('@')
+            dm_text = dm_text.format(channel_username=channel_username)
+            await client.send_message(user_id, dm_text)
+        except errors.PeerFloodError:
+            # Can't DM because of flood limit; optionally, reply in group (but we've deleted message)
+            pass
+        except errors.UserIsBlockedError:
+            # user has blocked the bot; nothing we can do
+            pass
         except Exception:
             pass
 
-        channels_text = "\n".join(CHANNELS)
-        try:
-            await event.reply(
-                f"❌ You need access to chat.\n1) Join these channels:\n{channels_text}\n"
-                f"2) Pay ₹10 via UPI to {UPI_ID} and send a screenshot in private.\n\n"
-                "After that you'll be allowed to chat."
-            )
-        except Exception as e:
-            print("reply error:", e)
+# ---------- Keep alive: simple Flask server for Render/Heroku ----------
+app = Flask('')
 
-# ---------------- MAIN LOOP ----------------
-async def main_loop():
-    while True:
-        try:
-            print("Client is running (awaiting events)...")
-            await client.run_until_disconnected()
-        except FloodWaitError as e:
-            print("FloodWaitError in main_loop:", e)
-            await asyncio.sleep(e.seconds + 5)
-        except Exception as e:
-            print("Unhandled error, will reconnect in 10s:", e)
-            await asyncio.sleep(10)
+@app.route('/')
+def home():
+    return "Bot is alive ✅"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+
+def start_keepalive():
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
+# ---------- Startup ----------
+async def main():
+    # start webserver
+    start_keepalive()
+    # optional: ensure bot admin etc.
+    ok = await ensure_bot_admin_in_group(GROUP)
+    # print status for logs
+    print("Bot started. Monitoring group:", GROUP, "Require channel:", CHANNEL)
+    # run until disconnected
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
     try:
-        asyncio.get_event_loop().run_until_complete(main_loop())
+        # run the Telethon client (this will block)
+        client.loop.run_until_complete(main())
     except KeyboardInterrupt:
-        print("Stopping by user")
+        print("Bot stopped by user")
+    except Exception as e:
+        print("Fatal error:", e)
